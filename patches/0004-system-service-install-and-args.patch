@@ -1,0 +1,415 @@
+diff --git a/cmd/tailscaled/install_darwin.go b/cmd/tailscaled/install_darwin.go
+index 4de1f3122c658241dda0553e971461f01902deeb..e1f01fe488018a6409d6a866d00b2b62ef4c22e0 100644
+--- a/cmd/tailscaled/install_darwin.go
++++ b/cmd/tailscaled/install_darwin.go
+@@ -13,6 +13,7 @@
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"strings"
+ )
+ 
+ func init() {
+@@ -100,10 +101,45 @@ func uninstallSystemDaemonDarwin(args []string) (ret error) {
+ 	return ret
+ }
+ 
++func xmlEscape(s string) string {
++	s = strings.ReplaceAll(s, "&", "&amp;")
++	s = strings.ReplaceAll(s, "<", "&lt;")
++	s = strings.ReplaceAll(s, ">", "&gt;")
++	s = strings.ReplaceAll(s, "\"", "&quot;")
++	return s
++}
++
++func renderDarwinPlist(args []string) string {
++	var sb strings.Builder
++	sb.WriteString("    <string>")
++	sb.WriteString(targetBin)
++	sb.WriteString("</string>\n")
++	for _, a := range args {
++		sb.WriteString("    <string>")
++		sb.WriteString(xmlEscape(a))
++		sb.WriteString("</string>\n")
++	}
++	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++
++  <key>Label</key>
++  <string>com.tailscale.tailscaled</string>
++
++  <key>ProgramArguments</key>
++  <array>
++%s  </array>
++
++  <key>RunAtLoad</key>
++  <true/>
++
++</dict>
++</plist>
++`, sb.String())
++}
++
+ func installSystemDaemonDarwin(args []string) (err error) {
+-	if len(args) > 0 {
+-		return errors.New("install subcommand takes no arguments")
+-	}
+ 	defer func() {
+ 		if err != nil && os.Getuid() != 0 {
+ 			err = fmt.Errorf("%w; try running tailscaled with sudo", err)
+@@ -131,7 +167,8 @@ func installSystemDaemonDarwin(args []string) (err error) {
+ 			return err
+ 		}
+ 	}
+-	if err := os.WriteFile(sysPlist, []byte(darwinLaunchdPlist), 0700); err != nil {
++	plistContent := renderDarwinPlist(args)
++	if err := os.WriteFile(sysPlist, []byte(plistContent), 0700); err != nil {
+ 		return err
+ 	}
+ 
+diff --git a/cmd/tailscaled/install_linux.go b/cmd/tailscaled/install_linux.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f31fffe249d6f3ee1ea9939dffcbb0eb55f974bd
+--- /dev/null
++++ b/cmd/tailscaled/install_linux.go
+@@ -0,0 +1,239 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build linux
++
++package main
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++)
++
++func init() {
++	installSystemDaemon = installSystemDaemonLinux
++	uninstallSystemDaemon = uninstallSystemDaemonLinux
++}
++
++const (
++	systemdServicePath = "/etc/systemd/system/tailscaled.service"
++	defaultTargetBin   = "/usr/local/bin/tailscaled"
++	serviceName        = "tailscaled.service"
++)
++
++func buildExecStart(targetBin string, args []string) string {
++	if len(args) == 0 {
++		return fmt.Sprintf("%s --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=${PORT} $FLAGS", targetBin)
++	}
++	parts := []string{targetBin}
++	hasSocket := false
++	hasState := false
++	for _, a := range args {
++		if strings.HasPrefix(a, "-socket") || strings.HasPrefix(a, "--socket") {
++			hasSocket = true
++		}
++		if strings.HasPrefix(a, "-state") || strings.HasPrefix(a, "--state") {
++			hasState = true
++		}
++		if strings.ContainsAny(a, " \t\n\"'") {
++			parts = append(parts, fmt.Sprintf("%q", a))
++		} else {
++			parts = append(parts, a)
++		}
++	}
++	if !hasSocket {
++		parts = append(parts, "--socket=/run/tailscale/tailscaled.sock")
++	}
++	if !hasState {
++		parts = append(parts, "--state=/var/lib/tailscale/tailscaled.state")
++	}
++	return strings.Join(parts, " ")
++}
++
++func buildSystemdUnit(targetBin string, args []string) string {
++	execStart := buildExecStart(targetBin, args)
++	return fmt.Sprintf(`[Unit]
++Description=Tailscale node agent
++Documentation=https://tailscale.com/docs/
++Wants=network-pre.target
++After=network-pre.target NetworkManager.service systemd-resolved.service
++
++[Service]
++EnvironmentFile=-/etc/default/tailscaled
++EnvironmentFile=-/etc/sysconfig/tailscaled
++ExecStart=%s
++ExecStopPost=%s --cleanup
++
++Restart=on-failure
++
++RuntimeDirectory=tailscale
++RuntimeDirectoryMode=0755
++StateDirectory=tailscale
++StateDirectoryMode=0700
++CacheDirectory=tailscale
++CacheDirectoryMode=0750
++Type=notify
++
++[Install]
++WantedBy=multi-user.target
++`, execStart, targetBin)
++}
++
++func installSystemDaemonLinux(args []string) (err error) {
++	if os.Geteuid() != 0 {
++		return errors.New("install-system-daemon must be run as root (or with sudo)")
++	}
++
++	if _, err := exec.LookPath("systemctl"); err != nil {
++		return fmt.Errorf("systemctl not found in PATH: %w", err)
++	}
++
++	if _, err := os.Stat("/run/systemd/system"); err != nil {
++		return errors.New("systemd does not appear to be running on this system (/run/systemd/system not found)")
++	}
++
++	exe, err := os.Executable()
++	if err != nil {
++		return fmt.Errorf("failed to find executable path: %w", err)
++	}
++	exe, err = filepath.EvalSymlinks(exe)
++	if err != nil {
++		return fmt.Errorf("failed to resolve executable path: %w", err)
++	}
++
++	targetBin := defaultTargetBin
++	if exe == "/usr/sbin/tailscaled" || exe == "/usr/bin/tailscaled" || exe == defaultTargetBin {
++		targetBin = exe
++	} else {
++		same, _ := sameFile(exe, defaultTargetBin)
++		if !same {
++			if err := copyBinary(exe, defaultTargetBin); err != nil {
++				return fmt.Errorf("failed to copy %s to %s: %w", exe, defaultTargetBin, err)
++			}
++		}
++		targetBin = defaultTargetBin
++
++		// If the companion "tailscale" CLI binary exists in the same directory, also copy it.
++		cliSrc := filepath.Join(filepath.Dir(exe), "tailscale")
++		if fi, err := os.Stat(cliSrc); err == nil && !fi.IsDir() {
++			cliDst := "/usr/local/bin/tailscale"
++			sameCLI, _ := sameFile(cliSrc, cliDst)
++			if !sameCLI {
++				_ = copyBinary(cliSrc, cliDst)
++			}
++		}
++	}
++
++	unitContent := buildSystemdUnit(targetBin, args)
++
++	if err := os.WriteFile(systemdServicePath, []byte(unitContent), 0644); err != nil {
++		return fmt.Errorf("failed to write %s: %w", systemdServicePath, err)
++	}
++
++	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
++		return fmt.Errorf("systemctl daemon-reload failed: %v\n%s", err, out)
++	}
++
++	if out, err := exec.Command("systemctl", "enable", "--now", serviceName).CombinedOutput(); err != nil {
++		return fmt.Errorf("systemctl enable --now %s failed: %v\n%s", serviceName, err, out)
++	}
++
++	fmt.Printf("Tailscale systemd service successfully installed and started (%s).\n", serviceName)
++	return nil
++}
++
++func uninstallSystemDaemonLinux(args []string) (ret error) {
++	if os.Geteuid() != 0 {
++		return errors.New("uninstall-system-daemon must be run as root (or with sudo)")
++	}
++
++	if _, err := exec.LookPath("systemctl"); err == nil {
++		out, err := exec.Command("systemctl", "stop", serviceName).CombinedOutput()
++		if err != nil && !strings.Contains(string(out), "not loaded") {
++			fmt.Printf("systemctl stop %s: %v, %s\n", serviceName, err, out)
++			ret = err
++		}
++		out, err = exec.Command("systemctl", "disable", serviceName).CombinedOutput()
++		if err != nil && !strings.Contains(string(out), "not loaded") {
++			fmt.Printf("systemctl disable %s: %v, %s\n", serviceName, err, out)
++			if ret == nil {
++				ret = err
++			}
++		}
++	}
++
++	if err := os.Remove(systemdServicePath); err != nil {
++		if !os.IsNotExist(err) {
++			if ret == nil {
++				ret = err
++			}
++		}
++	}
++
++	if _, err := exec.LookPath("systemctl"); err == nil {
++		_ = exec.Command("systemctl", "daemon-reload").Run()
++	}
++
++	// Remove default target binary if it was copied there and is not a symlink.
++	if !isSymlink(defaultTargetBin) {
++		_ = os.Remove(defaultTargetBin)
++	}
++
++	fmt.Println("Tailscale systemd service successfully uninstalled and stopped.")
++	return ret
++}
++
++func copyBinary(src, dst string) error {
++	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
++		return err
++	}
++	tmpBin := dst + ".tmp"
++	f, err := os.Create(tmpBin)
++	if err != nil {
++		return err
++	}
++	srcf, err := os.Open(src)
++	if err != nil {
++		f.Close()
++		return err
++	}
++	_, err = io.Copy(f, srcf)
++	srcf.Close()
++	if err != nil {
++		f.Close()
++		return err
++	}
++	if err := f.Close(); err != nil {
++		return err
++	}
++	if err := os.Chmod(tmpBin, 0755); err != nil {
++		return err
++	}
++	if err := os.Rename(tmpBin, dst); err != nil {
++		return err
++	}
++	return nil
++}
++
++func isSymlink(path string) bool {
++	fi, err := os.Lstat(path)
++	return err == nil && (fi.Mode()&os.ModeSymlink == os.ModeSymlink)
++}
++
++func sameFile(path1, path2 string) (bool, error) {
++	dst1, err := filepath.EvalSymlinks(path1)
++	if err != nil && !errors.Is(err, fs.ErrNotExist) {
++		return false, fmt.Errorf("EvalSymlinks(%s): %w", path1, err)
++	}
++	dst2, err := filepath.EvalSymlinks(path2)
++	if err != nil && !errors.Is(err, fs.ErrNotExist) {
++		return false, fmt.Errorf("EvalSymlinks(%s): %w", path2, err)
++	}
++	return dst1 == dst2, nil
++}
+diff --git a/cmd/tailscaled/install_linux_test.go b/cmd/tailscaled/install_linux_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c3e1c31f8fa408c8513341a4e1984cc5617aba0
+--- /dev/null
++++ b/cmd/tailscaled/install_linux_test.go
+@@ -0,0 +1,71 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build linux
++
++package main
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestBuildExecStart(t *testing.T) {
++	tests := []struct {
++		name      string
++		targetBin string
++		args      []string
++		want      string
++	}{
++		{
++			name:      "default-empty-args",
++			targetBin: "/usr/local/bin/tailscaled",
++			args:      nil,
++			want:      "/usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=${PORT} $FLAGS",
++		},
++		{
++			name:      "custom-statedir",
++			targetBin: "/usr/local/bin/tailscaled",
++			args:      []string{"-statedir=/data/tailscale"},
++			want:      "/usr/local/bin/tailscaled -statedir=/data/tailscale --socket=/run/tailscale/tailscaled.sock",
++		},
++		{
++			name:      "custom-state-and-socket",
++			targetBin: "/usr/sbin/tailscaled",
++			args:      []string{"--state=/var/lib/tailscale/tailscaled.state", "--socket=/tmp/tailscaled.sock"},
++			want:      "/usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/tmp/tailscaled.sock",
++		},
++		{
++			name:      "args-with-spaces",
++			targetBin: "/usr/local/bin/tailscaled",
++			args:      []string{"-statedir=/mnt/my data/tailscale"},
++			want:      `/usr/local/bin/tailscaled "-statedir=/mnt/my data/tailscale" --socket=/run/tailscale/tailscaled.sock`,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := buildExecStart(tt.targetBin, tt.args)
++			if got != tt.want {
++				t.Errorf("buildExecStart(%q, %v) = %q, want %q", tt.targetBin, tt.args, got, tt.want)
++			}
++		})
++	}
++}
++
++func TestBuildSystemdUnit(t *testing.T) {
++	unit := buildSystemdUnit("/usr/local/bin/tailscaled", []string{"-statedir=/var/lib/tailscale"})
++	for _, expected := range []string{
++		"[Unit]",
++		"[Service]",
++		"[Install]",
++		"ExecStart=/usr/local/bin/tailscaled -statedir=/var/lib/tailscale --socket=/run/tailscale/tailscaled.sock",
++		"ExecStopPost=/usr/local/bin/tailscaled --cleanup",
++		"Type=notify",
++		"WantedBy=multi-user.target",
++	} {
++		if !strings.Contains(unit, expected) {
++			t.Errorf("buildSystemdUnit missing %q; got:\n%s", expected, unit)
++		}
++	}
++}
+diff --git a/cmd/tailscaled/install_windows.go b/cmd/tailscaled/install_windows.go
+index d0f40b37d1156781e0e3b979e1671e2e0212bc56..0b4cc1cada750b9c8e1240ac7e91a055a3de3b7b 100644
+--- a/cmd/tailscaled/install_windows.go
++++ b/cmd/tailscaled/install_windows.go
+@@ -44,7 +44,7 @@ func installSystemDaemonWindows(args []string) (err error) {
+ 	service, err := m.OpenService(serviceName)
+ 	if err == nil {
+ 		service.Close()
+-		return fmt.Errorf("service %q is already installed", serviceName)
++		return fmt.Errorf("service %q is already installed; run 'tailscaled.exe uninstall-system-daemon' first to reinstall", serviceName)
+ 	}
+ 
+ 	// no such service; proceed to install the service.
+@@ -63,7 +63,7 @@ func installSystemDaemonWindows(args []string) (err error) {
+ 		Description:  "Connects this computer to others on the Tailscale network.",
+ 	}
+ 
+-	service, err = m.CreateService(serviceName, exe, c)
++	service, err = m.CreateService(serviceName, exe, c, args...)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to create %q service: %v", serviceName, err)
+ 	}

@@ -1,0 +1,578 @@
+diff --git a/cmd/tailscale/cli/debug.go b/cmd/tailscale/cli/debug.go
+index 5dc503b268fe11da6ae1d67cc569728247013f6c..aa780602a305ff2760b559e2e8cecc9b0583aa4c 100644
+--- a/cmd/tailscale/cli/debug.go
++++ b/cmd/tailscale/cli/debug.go
+@@ -234,6 +234,7 @@ func debugCmd() *ffcli.Command {
+ 				Exec:       forcePreferDERP,
+ 				ShortHelp:  "Prefer the given region ID if reachable (until restart, or 0 to clear)",
+ 			},
++			debugForceDERPCmd,
+ 			{
+ 				Name:       "force-netmap-update",
+ 				ShortUsage: "tailscale debug force-netmap-update",
+diff --git a/cmd/tailscale/cli/debug_forcederp.go b/cmd/tailscale/cli/debug_forcederp.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d5c760f9ecad832ecc20c022963a35e73daa796
+--- /dev/null
++++ b/cmd/tailscale/cli/debug_forcederp.go
+@@ -0,0 +1,50 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package cli
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strconv"
++
++	"github.com/peterbourgon/ff/v3/ffcli"
++	"tailscale.com/client/local"
++)
++
++var debugForceDERPCmd = &ffcli.Command{
++	Name:       "force-derp",
++	ShortUsage: "tailscale debug force-derp [true|false]",
++	Exec:       runForceDERP,
++	ShortHelp:  "Configure whether to force relaying via DERP",
++}
++
++func runForceDERP(ctx context.Context, args []string) error {
++	switch len(args) {
++	case 0:
++		v, err := local.GetDebugResultJSON[bool](ctx, &localClient, "force-derp")
++		if err != nil {
++			return fmt.Errorf("failed to get force-derp status: %w", err)
++		}
++		printf("%v\n", v)
++		return nil
++	case 1:
++		b, err := strconv.ParseBool(args[0])
++		if err != nil {
++			return fmt.Errorf("invalid boolean argument %q (expected true or false): %w", args[0], err)
++		}
++		body, err := json.Marshal(b)
++		if err != nil {
++			return err
++		}
++		if err := localClient.DebugActionBody(ctx, "force-derp", bytes.NewReader(body)); err != nil {
++			return fmt.Errorf("failed to set force-derp: %w", err)
++		}
++		return nil
++	default:
++		return errors.New("expected at most one boolean argument (true or false)")
++	}
++}
+diff --git a/cmd/tailscale/cli/debug_forcederp_test.go b/cmd/tailscale/cli/debug_forcederp_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d977a7dbc47f36247b6b0add7b752f83c13e82c
+--- /dev/null
++++ b/cmd/tailscale/cli/debug_forcederp_test.go
+@@ -0,0 +1,37 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package cli
++
++import (
++	"context"
++	"testing"
++)
++
++func TestDebugForceDERPSubcommand(t *testing.T) {
++	cmd := debugCmd()
++	var found bool
++	for _, sub := range cmd.Subcommands {
++		if sub.Name == "force-derp" {
++			found = true
++			if sub.Exec == nil {
++				t.Error("force-derp subcommand Exec is nil")
++			}
++			break
++		}
++	}
++	if !found {
++		t.Fatal("force-derp subcommand not found in debugCmd")
++	}
++
++	// Test argument validation
++	err := runForceDERP(context.Background(), []string{"not-a-bool"})
++	if err == nil {
++		t.Fatal("expected error for invalid boolean argument")
++	}
++
++	err = runForceDERP(context.Background(), []string{"true", "extra"})
++	if err == nil {
++		t.Fatal("expected error for extra arguments")
++	}
++}
+diff --git a/ipn/ipnlocal/forcederp.go b/ipn/ipnlocal/forcederp.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..db0d98b91156ecb9690d7d217e8769a6361447c9
+--- /dev/null
++++ b/ipn/ipnlocal/forcederp.go
+@@ -0,0 +1,19 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package ipnlocal
++
++// DebugSetForceDERP controls whether magicsock is forced to only use DERP relay.
++func (b *LocalBackend) DebugSetForceDERP(v bool) {
++	if mc := b.MagicConn(); mc != nil {
++		mc.SetForceDERP(v)
++	}
++}
++
++// DebugForceDERP reports whether magicsock is forced to only use DERP relay.
++func (b *LocalBackend) DebugForceDERP() bool {
++	if mc := b.MagicConn(); mc != nil {
++		return mc.ForceDERP()
++	}
++	return false
++}
+diff --git a/ipn/localapi/debug.go b/ipn/localapi/debug.go
+index b2aa87fff8a50740400a4735c13aa1a690913d46..86d865c7b0c3bf9cf8e012dd3e84568f6ce9f400 100644
+--- a/ipn/localapi/debug.go
++++ b/ipn/localapi/debug.go
+@@ -223,6 +223,10 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
+ 			break
+ 		}
+ 		h.b.DebugForcePreferDERP(n)
++	case "force-derp":
++		if err = h.serveDebugForceDERP(w, r); err == nil {
++			return
++		}
+ 	case "peer-relay-servers":
+ 		servers := h.b.DebugPeerRelayServers().Slice()
+ 		slices.SortFunc(servers, func(a, b netip.Addr) int {
+diff --git a/ipn/localapi/debug_forcederp.go b/ipn/localapi/debug_forcederp.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf0094fc260d541b5759aead93ed5b583864a9f8
+--- /dev/null
++++ b/ipn/localapi/debug_forcederp.go
+@@ -0,0 +1,26 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !ts_omit_debug
++
++package localapi
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++)
++
++func (h *Handler) serveDebugForceDERP(w http.ResponseWriter, r *http.Request) error {
++	if r.Body != nil {
++		var v bool
++		if err := json.NewDecoder(r.Body).Decode(&v); err == nil {
++			h.b.DebugSetForceDERP(v)
++		} else if !errors.Is(err, io.EOF) {
++			return err
++		}
++	}
++	w.Header().Set("Content-Type", "application/json")
++	return json.NewEncoder(w).Encode(h.b.DebugForceDERP())
++}
+diff --git a/ipn/localapi/debug_forcederp_test.go b/ipn/localapi/debug_forcederp_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..07fe5f4f8285f7f81343e72be12a388bfaf92c7d
+--- /dev/null
++++ b/ipn/localapi/debug_forcederp_test.go
+@@ -0,0 +1,60 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !ts_omit_debug
++
++package localapi
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestServeDebugForceDERP(t *testing.T) {
++	b := newTestLocalBackend(t)
++	h := handlerForTest(t, &Handler{
++		PermitWrite: true,
++		b:           b,
++	})
++
++	// 1. Initial query: should be false
++	req := httptest.NewRequest("POST", "http://local-tailscaled.sock/localapi/v0/debug?action=force-derp", nil)
++	resp := httptest.NewRecorder()
++	h.serveDebug(resp, req)
++	if resp.Code != http.StatusOK {
++		t.Fatalf("query status = %d, want 200; body: %s", resp.Code, resp.Body.String())
++	}
++	if strings.TrimSpace(resp.Body.String()) != "false" {
++		t.Fatalf("query body = %q, want false", resp.Body.String())
++	}
++
++	// 2. Set to true
++	req = httptest.NewRequest("POST", "http://local-tailscaled.sock/localapi/v0/debug?action=force-derp", strings.NewReader("true"))
++	resp = httptest.NewRecorder()
++	h.serveDebug(resp, req)
++	if resp.Code != http.StatusOK {
++		t.Fatalf("set status = %d, want 200; body: %s", resp.Code, resp.Body.String())
++	}
++	if strings.TrimSpace(resp.Body.String()) != "true" {
++		t.Fatalf("set body = %q, want true", resp.Body.String())
++	}
++	if !b.DebugForceDERP() {
++		t.Fatalf("b.DebugForceDERP() = false, want true")
++	}
++
++	// 3. Set to false
++	req = httptest.NewRequest("POST", "http://local-tailscaled.sock/localapi/v0/debug?action=force-derp", strings.NewReader("false"))
++	resp = httptest.NewRecorder()
++	h.serveDebug(resp, req)
++	if resp.Code != http.StatusOK {
++		t.Fatalf("unset status = %d, want 200; body: %s", resp.Code, resp.Body.String())
++	}
++	if strings.TrimSpace(resp.Body.String()) != "false" {
++		t.Fatalf("unset body = %q, want false", resp.Body.String())
++	}
++	if b.DebugForceDERP() {
++		t.Fatalf("b.DebugForceDERP() = true, want false")
++	}
++}
+diff --git a/wgengine/magicsock/endpoint.go b/wgengine/magicsock/endpoint.go
+index 823a702d12f68abf6526da128581b313e3e759c4..6fe74b1bb4c250b22eeed6c46b3d5f2668b88b26 100644
+--- a/wgengine/magicsock/endpoint.go
++++ b/wgengine/magicsock/endpoint.go
+@@ -111,6 +111,9 @@ type endpoint struct {
+ // be installed as de.bestAddr. It is only called by [relayManager] once it has
+ // determined maybeBest is functional via [disco.Pong] reception.
+ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
++	if de.c.ForceDERP() {
++		return
++	}
+ 	de.mu.Lock()
+ 	defer de.mu.Unlock()
+ 	now := mono.Now()
+@@ -633,6 +636,9 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
+ //
+ // TODO(val): Rewrite the addrFor*Locked() variations to share code.
+ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
++	if de.c.ForceDERP() {
++		return epAddr{}, de.derpAddr, false
++	}
+ 	udpAddr = de.bestAddr.epAddr
+ 
+ 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
+@@ -717,6 +723,9 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, s
+ //
+ // de.mu must be held.
+ func (de *endpoint) addrForPingSizeLocked(now mono.Time, size int) (udpAddr epAddr, derpAddr netip.AddrPort) {
++	if de.c.ForceDERP() {
++		return epAddr{}, de.derpAddr
++	}
+ 	if size == 0 {
+ 		udpAddr, derpAddr, _ = de.addrForSendLocked(now)
+ 		return
+@@ -963,7 +972,7 @@ func (de *endpoint) discoverUDPRelayPathsLocked(now mono.Time) {
+ // wantUDPRelayPathDiscoveryLocked reports whether we should kick off UDP relay
+ // path discovery.
+ func (de *endpoint) wantUDPRelayPathDiscoveryLocked(now mono.Time) bool {
+-	if runtime.GOOS == "js" {
++	if runtime.GOOS == "js" || de.c.ForceDERP() {
+ 		return false
+ 	}
+ 	if !de.c.relayManager.hasPeerRelayServers.Load() {
+@@ -1004,7 +1013,7 @@ func (de *endpoint) wantUDPRelayPathDiscoveryLocked(now mono.Time) bool {
+ //
+ // de.mu must be held.
+ func (de *endpoint) wantFullPingLocked(now mono.Time) bool {
+-	if runtime.GOOS == "js" {
++	if runtime.GOOS == "js" || de.c.ForceDERP() {
+ 		return false
+ 	}
+ 	if !de.bestAddr.isDirect() || de.lastFullPing.IsZero() {
+@@ -1070,6 +1079,10 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
+ 		de.startDiscoPingLocked(epAddr{ap: derpAddr}, now, pingCLI, size, resCB)
+ 	}
+ 
++	if de.c.ForceDERP() {
++		return
++	}
++
+ 	switch {
+ 	case udpAddr.ap.IsValid() && now.Before(de.trustBestAddrUntil):
+ 		// We have a "trusted" direct OR peer relay address, ping it.
+@@ -1362,7 +1375,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
+ 	if runtime.GOOS == "js" {
+ 		return
+ 	}
+-	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
++	if (debugNeverDirectUDP() || de.c.ForceDERP()) && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
+ 		return
+ 	}
+ 	epDisco := de.disco.Load()
+@@ -1426,7 +1439,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
+ // sendDiscoPingsLocked starts pinging all of ep's direct endpoints.
+ // Sibling of discoverUDPRelayPathsLocked for udprelay.
+ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
+-	if debugNeverDirectUDP() {
++	if debugNeverDirectUDP() || de.c.ForceDERP() {
+ 		return // skip when direct UDP is disabled
+ 	}
+ 	de.lastFullPing = now
+@@ -1995,7 +2008,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
+ 
+ 	// Promote this pong response to our current best address if it's lower latency.
+ 	// TODO(bradfitz): decide how latency vs. preference order affects decision
+-	if hasUDPTransport && !isDerp {
++	if hasUDPTransport && !isDerp && !de.c.ForceDERP() {
+ 		thisPong := addrQuality{
+ 			epAddr:  sp.to,
+ 			latency: latency,
+@@ -2154,8 +2167,8 @@ func betterAddr(a, b addrQuality) bool {
+ // already sent to us via UDP, so their stateful firewall should be
+ // open. Now we can Ping back and make it through.
+ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
+-	if runtime.GOOS == "js" {
+-		// Nothing to do on js/wasm if we can't send UDP packets anyway.
++	if runtime.GOOS == "js" || de.c.ForceDERP() {
++		// Nothing to do on js/wasm or if forcing DERP.
+ 		return
+ 	}
+ 	de.mu.Lock()
+diff --git a/wgengine/magicsock/forcederp.go b/wgengine/magicsock/forcederp.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e407565f4a849d2386d6636b63e946492a31f97c
+--- /dev/null
++++ b/wgengine/magicsock/forcederp.go
+@@ -0,0 +1,27 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++// ForceDERP reports whether magicsock is forced to only use DERP relay.
++func (c *Conn) ForceDERP() bool {
++	return c != nil && c.forceDERP.Load()
++}
++
++// SetForceDERP controls whether magicsock is forced to only use DERP relay.
++// If true, direct UDP connections are disabled, active bestAddr mappings are
++// cleared, and all peer communication is forced over DERP.
++func (c *Conn) SetForceDERP(v bool) {
++	c.logf("magicsock: [debug] force DERP set to: %v", v)
++	c.forceDERP.Store(v)
++	c.mu.Lock()
++	if v {
++		c.peerMap.forEachEndpoint(func(ep *endpoint) {
++			ep.mu.Lock()
++			ep.clearBestAddrLocked()
++			ep.mu.Unlock()
++		})
++	}
++	c.mu.Unlock()
++	c.ReSTUN("force-derp")
++}
+diff --git a/wgengine/magicsock/forcederp_test.go b/wgengine/magicsock/forcederp_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a354004436f7b85a2e4ed664526ae7e6f6db66f
+--- /dev/null
++++ b/wgengine/magicsock/forcederp_test.go
+@@ -0,0 +1,112 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++	"time"
++
++	"tailscale.com/tailcfg"
++	"tailscale.com/tstime/mono"
++	"tailscale.com/types/key"
++)
++
++func TestForceDERP(t *testing.T) {
++	c := newConn(t.Logf)
++	// newConn has no packet connections; keep ReSTUN from starting an async
++	// endpoint update that would expect initialized sockets.
++	c.mu.Lock()
++	c.closed = true
++	c.mu.Unlock()
++
++	if c.ForceDERP() {
++		t.Fatal("expected ForceDERP initially false")
++	}
++
++	nodeKey := key.NewNode().Public()
++	ep := &endpoint{
++		c:         c,
++		nodeID:    1,
++		publicKey: nodeKey,
++		bestAddr: addrQuality{
++			epAddr: epAddr{ap: netip.MustParseAddrPort("192.168.1.100:1234")},
++		},
++		trustBestAddrUntil: mono.Now().Add(time.Hour),
++		derpAddr:           netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 2),
++	}
++
++	c.mu.Lock()
++	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
++	c.mu.Unlock()
++
++	// Enable force-derp
++	c.SetForceDERP(true)
++	if !c.ForceDERP() {
++		t.Fatal("expected ForceDERP to be true after SetForceDERP(true)")
++	}
++
++	// Verify that existing bestAddr was cleared
++	ep.mu.Lock()
++	if ep.bestAddr.ap.IsValid() {
++		t.Fatalf("expected bestAddr to be cleared, got %v", ep.bestAddr.ap)
++	}
++	ep.mu.Unlock()
++
++	// Verify addrForSendLocked returns DERP only
++	now := mono.Now()
++	ep.mu.Lock()
++	udpAddr, derpAddr, shouldPing := ep.addrForSendLocked(now)
++	ep.mu.Unlock()
++
++	if udpAddr.ap.IsValid() {
++		t.Fatalf("addrForSendLocked returned valid udpAddr %v, want empty", udpAddr)
++	}
++	wantDerp := netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 2)
++	if derpAddr != wantDerp {
++		t.Fatalf("addrForSendLocked derpAddr = %v, want %v", derpAddr, wantDerp)
++	}
++	if shouldPing {
++		t.Fatal("addrForSendLocked shouldPing = true, want false")
++	}
++
++	// Verify addrForPingSizeLocked returns DERP only
++	ep.mu.Lock()
++	udpAddr, derpAddr = ep.addrForPingSizeLocked(now, 100)
++	ep.mu.Unlock()
++
++	if udpAddr.ap.IsValid() {
++		t.Fatalf("addrForPingSizeLocked returned valid udpAddr %v, want empty", udpAddr)
++	}
++	if derpAddr != wantDerp {
++		t.Fatalf("addrForPingSizeLocked derpAddr = %v, want %v", derpAddr, wantDerp)
++	}
++
++	// Verify determineEndpoints returns nil endpoints when ForceDERP is true
++	eps, err := c.determineEndpoints(context.Background())
++	if err != nil {
++		t.Fatalf("determineEndpoints error: %v", err)
++	}
++	if len(eps) != 0 {
++		t.Fatalf("determineEndpoints returned %d endpoints, want 0", len(eps))
++	}
++
++	// Verify UDP sending is blocked
++	sent, err := c.sendUDP(netip.MustParseAddrPort("192.168.1.100:1234"), []byte("test"), false, false)
++	if sent || err != errNoUDP {
++		t.Fatalf("sendUDP returned sent=%v, err=%v; want sent=false, errNoUDP", sent, err)
++	}
++
++	sent, err = c.sendUDPBatch(epAddr{ap: netip.MustParseAddrPort("192.168.1.100:1234")}, [][]byte{[]byte("test")}, 0)
++	if sent || err != errNoUDP {
++		t.Fatalf("sendUDPBatch returned sent=%v, err=%v; want sent=false, errNoUDP", sent, err)
++	}
++
++	// Disable force-derp
++	c.SetForceDERP(false)
++	if c.ForceDERP() {
++		t.Fatal("expected ForceDERP to be false after SetForceDERP(false)")
++	}
++}
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index 84de9fc7e98cd70ae95910fdf12b1ebb13cfccc0..44b8a0ba6a8c11ff27db1e9947db5d2a6dc45f2c 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -283,6 +283,7 @@ type Conn struct {
+ 	muCond *sync.Cond
+ 
+ 	onlyTCP443 atomic.Bool
++	forceDERP  atomic.Bool
+ 
+ 	closed  bool        // Close was called
+ 	closing atomic.Bool // Close is in progress (or done)
+@@ -592,6 +593,7 @@ func newConn(logf logger.Logf) *Conn {
+ 	c.bind = &connBind{Conn: c, closed: true}
+ 	c.muCond = sync.NewCond(&c.mu)
+ 	c.networkUp.Store(true) // assume up until told otherwise
++	c.forceDERP.Store(debugNeverDirectUDP())
+ 	return c
+ }
+ 
+@@ -1299,7 +1301,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
+ 			},
+ 		}, nil
+ 	}
+-	if !hasUDPTransport {
++	if !hasUDPTransport || c.ForceDERP() {
+ 		// Peers can only reach us over DERP, so we have no endpoints to
+ 		// advertise.
+ 		return nil, nil
+@@ -1541,7 +1543,7 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
+ var errUnsupportedConnType = errors.New("unsupported connection type")
+ 
+ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
+-	if !hasUDPTransport {
++	if !hasUDPTransport || c.ForceDERP() {
+ 		return false, errNoUDP
+ 	}
+ 	isIPv6 := false
+@@ -1571,7 +1573,7 @@ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool,
+ // sendUDP sends UDP packet b to ipp.
+ // See sendAddr's docs on the return value meanings.
+ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
+-	if !hasUDPTransport {
++	if !hasUDPTransport || c.ForceDERP() {
+ 		return false, errNoUDP
+ 	}
+ 	sent, err = c.sendUDPStd(ipp, b)
+@@ -1843,6 +1845,9 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
+ 	}
+ 	switch pt {
+ 	case packetLooksLikeDisco:
++		if c.ForceDERP() {
++			return false, false
++		}
+ 		if isGeneveEncap {
+ 			b = b[packet.GeneveFixedHeaderLength:]
+ 		}
+@@ -1863,6 +1868,10 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
+ 		// be potentially WireGuard.
+ 	}
+ 
++	if c.ForceDERP() {
++		return false, false
++	}
++
+ 	if !c.havePrivateKey.Load() {
+ 		// If we have no private key, we're logged out or
+ 		// stopped. Don't try to pass these wireguard packets
+@@ -2582,7 +2591,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
+ 
+ 	// This is a naked [disco.Ping] without a VNI.
+ 
+-	if debugNeverDirectUDP() && !isDerp {
++	if (debugNeverDirectUDP() || c.ForceDERP()) && !isDerp {
+ 		return
+ 	}
+ 
