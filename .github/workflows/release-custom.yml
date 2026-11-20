@@ -1,0 +1,224 @@
+name: Build Custom Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag or custom release tag (e.g. v1.104.4-custom)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Apply patch and run tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4
+
+      - name: Check out upstream tag and apply patch
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "Invalid tag: $INPUT_TAG"
+            exit 1
+          fi
+          BASE_TAG="${INPUT_TAG%-custom}"
+          if [[ ! "$BASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Expected a Tailscale version tag, optionally suffixed with -custom: $INPUT_TAG"
+            exit 1
+          fi
+
+          git init source
+          git -C source remote add upstream https://github.com/tailscale/tailscale.git
+          git -C source fetch --depth=1 upstream "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}"
+          git -C source checkout --detach "refs/tags/${BASE_TAG}"
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            test -f "$patch" || { echo "No patch files found"; exit 1; }
+            echo "Applying $(basename "$patch")"
+            git -C source apply --check "$patch"
+            git -C source apply "$patch"
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: true
+          cache-dependency-path: source/go.sum
+
+      - name: Run targeted tests
+        working-directory: source
+        run: go test ./cmd/tailscale/... ./cmd/tailscaled/... ./ipn/localapi/... ./ipn/ipnlocal/... ./wgengine/magicsock/...
+
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            binary_ext: ""
+            archive_type: tar.gz
+          - os: linux
+            arch: arm64
+            binary_ext: ""
+            archive_type: tar.gz
+          - os: darwin
+            arch: arm64
+            binary_ext: ""
+            archive_type: tar.gz
+          - os: windows
+            arch: amd64
+            binary_ext: .exe
+            archive_type: zip
+
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4
+
+      - name: Check out upstream tag and apply patch
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          BASE_TAG="${INPUT_TAG%-custom}"
+          git init source
+          git -C source remote add upstream https://github.com/tailscale/tailscale.git
+          git -C source fetch --depth=1 upstream "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}"
+          git -C source checkout --detach "refs/tags/${BASE_TAG}"
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            test -f "$patch" || { echo "No patch files found"; exit 1; }
+            echo "Applying $(basename "$patch")"
+            git -C source apply --check "$patch"
+            git -C source apply "$patch"
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: true
+          cache-dependency-path: source/go.sum
+
+      - name: Build and package binaries
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          GOOS_TARGET: ${{ matrix.os }}
+          GOARCH_TARGET: ${{ matrix.arch }}
+          BINARY_EXT: ${{ matrix.binary_ext }}
+          ARCHIVE_TYPE: ${{ matrix.archive_type }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="$INPUT_TAG"
+          mkdir -p dist source/build
+          BUILD_DIR="$GITHUB_WORKSPACE/source/build/${GOOS_TARGET}_${GOARCH_TARGET}"
+          mkdir -p "$BUILD_DIR"
+          LDFLAGS="-s -w -X tailscale.com/version.longStamp=${RELEASE_TAG} -X tailscale.com/version.shortStamp=${RELEASE_TAG}"
+
+          cd source
+          go mod download
+          CGO_ENABLED=0 GOOS="$GOOS_TARGET" GOARCH="$GOARCH_TARGET" go build -ldflags="$LDFLAGS" -o "$BUILD_DIR/tailscale${BINARY_EXT}" ./cmd/tailscale
+          CGO_ENABLED=0 GOOS="$GOOS_TARGET" GOARCH="$GOARCH_TARGET" go build -ldflags="$LDFLAGS" -o "$BUILD_DIR/tailscaled${BINARY_EXT}" ./cmd/tailscaled
+
+          ARCHIVE_NAME="tailscale_${RELEASE_TAG}_${GOOS_TARGET}_${GOARCH_TARGET}.${ARCHIVE_TYPE}"
+          if [[ "$ARCHIVE_TYPE" == zip ]]; then
+            (cd "$BUILD_DIR" && zip -r "$GITHUB_WORKSPACE/dist/$ARCHIVE_NAME" "tailscale${BINARY_EXT}" "tailscaled${BINARY_EXT}")
+          else
+            tar -czf "$GITHUB_WORKSPACE/dist/$ARCHIVE_NAME" -C "$BUILD_DIR" "tailscale${BINARY_EXT}" "tailscaled${BINARY_EXT}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 1
+
+  build-derper:
+    name: Build DERP Server (linux/amd64)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4
+
+      - name: Check out upstream tag and apply patch
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          BASE_TAG="${INPUT_TAG%-custom}"
+          git init source
+          git -C source remote add upstream https://github.com/tailscale/tailscale.git
+          git -C source fetch --depth=1 upstream "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}"
+          git -C source checkout --detach "refs/tags/${BASE_TAG}"
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            test -f "$patch" || { echo "No patch files found"; exit 1; }
+            echo "Applying $(basename "$patch")"
+            git -C source apply --check "$patch"
+            git -C source apply "$patch"
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: true
+          cache-dependency-path: source/go.sum
+
+      - name: Build and package derper
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist source/build/linux_amd64
+          LDFLAGS="-s -w -X tailscale.com/version.longStamp=${INPUT_TAG} -X tailscale.com/version.shortStamp=${INPUT_TAG}"
+          cd source
+          go mod download
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$LDFLAGS" -o build/linux_amd64/derper ./cmd/derper
+          tar -czf "$GITHUB_WORKSPACE/dist/derper_${INPUT_TAG}_linux_amd64.tar.gz" -C build/linux_amd64 derper
+
+      - name: Upload DERP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-derper-linux-amd64
+          path: dist/*
+          retention-days: 1
+
+  release:
+    name: Publish Release Assets
+    needs: [build, build-derper]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tailscale-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums and publish release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum * > sha256sums.txt)
+          if gh release view "$INPUT_TAG" >/dev/null 2>&1; then
+            gh release upload "$INPUT_TAG" dist/* --clobber
+            gh release edit "$INPUT_TAG" --notes "Custom Tailscale build for $INPUT_TAG, assembled from the upstream source with this repository's patch."
+          else
+            gh release create "$INPUT_TAG" dist/* \
+              --title "$INPUT_TAG" \
+              --notes "Custom Tailscale build for $INPUT_TAG, assembled from the upstream source with this repository's patch."
+          fi

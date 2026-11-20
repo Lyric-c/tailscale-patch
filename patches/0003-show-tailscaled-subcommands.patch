@@ -1,0 +1,104 @@
+diff --git a/cmd/tailscaled/debug.go b/cmd/tailscaled/debug.go
+index 360075f5b0e2b984f30a5f4906d8463339e04e36..05f35a96db4a53918553cb8b47fd0734aebc551e 100644
+--- a/cmd/tailscaled/debug.go
++++ b/cmd/tailscaled/debug.go
+@@ -73,6 +73,10 @@ func debugMode(args []string) error {
+ 	fs.BoolVar(&debugArgs.portmap, "portmap", false, "If true, run portmap debugging. Precludes all other options.")
+ 	fs.StringVar(&debugArgs.getURL, "get-url", "", "If non-empty, fetch provided URL.")
+ 	fs.StringVar(&debugArgs.derpCheck, "derp", "", "if non-empty, test a DERP ping via named region code")
++	if len(args) == 0 {
++		fs.Usage()
++		return nil
++	}
+ 	if err := fs.Parse(args); err != nil {
+ 		return err
+ 	}
+diff --git a/cmd/tailscaled/tailscaled_test.go b/cmd/tailscaled/tailscaled_test.go
+index ab6482293687b45069761f2e01d311392d21310c..d3df4ea8617e63056942d98de51b66183d1aef48 100644
+--- a/cmd/tailscaled/tailscaled_test.go
++++ b/cmd/tailscaled/tailscaled_test.go
+@@ -4,6 +4,8 @@
+ package main // import "tailscale.com/cmd/tailscaled"
+ 
+ import (
++	"bytes"
++	"flag"
+ 	"os"
+ 	"strings"
+ 	"testing"
+@@ -141,3 +143,18 @@ func TestIsPortableStore(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestUsage(t *testing.T) {
++	var buf bytes.Buffer
++	flag.CommandLine.SetOutput(&buf)
++	defer flag.CommandLine.SetOutput(os.Stderr)
++
++	usage()
++
++	out := buf.String()
++	for _, sub := range []string{"install-system-daemon", "uninstall-system-daemon", "debug"} {
++		if !strings.Contains(out, sub) {
++			t.Errorf("usage output missing subcommand %q; got:\n%s", sub, out)
++		}
++	}
++}
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index 2df7ed8894944e6b84487182f63bf242e73cd9bc..4a81781770b8e6132db0f44d31fcdd12cf80d0b1 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -246,12 +246,18 @@ func main() {
+ 		f()
+ 	}
+ 
++	flag.Usage = usage
++
+ 	if runtime.GOOS == "plan9" && os.Getenv("_NETSHELL_CHILD_") != "" {
+ 		os.Args = []string{"tailscaled", "be-child", "plan9-netshell"}
+ 	}
+ 
+ 	if len(os.Args) > 1 {
+ 		sub := os.Args[1]
++		if sub == "help" {
++			flag.Usage()
++			return
++		}
+ 		if fp, ok := subCommands[sub]; ok {
+ 			if fp == nil {
+ 				log.SetFlags(0)
+@@ -353,6 +359,33 @@ func main() {
+ 	}
+ }
+ 
++func usage() {
++	out := flag.CommandLine.Output()
++	fmt.Fprintf(out, "Usage: %s [flags]\n", os.Args[0])
++	fmt.Fprintf(out, "       %s <subcommand> [flags]\n\n", os.Args[0])
++	fmt.Fprintf(out, "Subcommands:\n")
++	switch runtime.GOOS {
++	case "windows":
++		fmt.Fprintf(out, "  install-system-daemon [flags]\n        install tailscaled as a native Windows service\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and remove the native Windows service\n")
++	case "darwin":
++		fmt.Fprintf(out, "  install-system-daemon [flags]\n        install and start tailscaled as a macOS launchd daemon\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and stop the macOS launchd daemon\n")
++	case "linux":
++		fmt.Fprintf(out, "  install-system-daemon [flags]\n        install and start tailscaled as a systemd service\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and stop the systemd service\n")
++	default:
++		fmt.Fprintf(out, "  install-system-daemon [flags] (Linux, Windows and macOS only)\n        install tailscaled as a native system service\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon (Linux, Windows and macOS only)\n        uninstall and remove the native system service\n")
++	}
++	if buildfeatures.HasDebug {
++		fmt.Fprintf(out, "  debug [debug-flags]\n        run network diagnostics and debugging tools\n")
++		fmt.Fprintf(out, "        flags: --ifconfig, --monitor, --derp=<region>, --get-url=<url>\n")
++	}
++	fmt.Fprintf(out, "\nFlags:\n")
++	flag.PrintDefaults()
++}
++
+ // applyWindowsMode validates --windows-mode and --socket on Windows and, in
+ // dev mode, applies the per-user default socket.
+ //
