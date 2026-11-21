@@ -1,0 +1,102 @@
+From 3437f938f4021ce5710a6a823d80eaccffa7344b Mon Sep 17 00:00:00 2001
+From: Irelia <cchuanzhao@gmail.com>
+Date: Mon, 19 Oct 2026 09:35:03 +0800
+Subject: [PATCH 04/10] feat: auto enable no-logs-no-support by default,
+ replace armv7 with macos builds
+
+---
+ .github/workflows/release-custom.yml | 23 +++++++++++++++--------
+ README.md                            | 11 ++++++++++-
+ cmd/tailscaled/tailscaled.go         |  2 +-
+ 3 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/.github/workflows/release-custom.yml b/.github/workflows/release-custom.yml
+index b49968580..71f0d1520 100644
+--- a/.github/workflows/release-custom.yml
++++ b/.github/workflows/release-custom.yml
+@@ -88,12 +88,19 @@ jobs:
+           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o build/linux_arm64/tailscaled ./cmd/tailscaled
+           tar -czvf "dist/tailscale_${TAG}_linux_arm64.tar.gz" -C build/linux_arm64 tailscale tailscaled
+ 
+-          # Linux armv7
+-          echo "Building linux/armv7..."
+-          mkdir -p build/linux_armv7
+-          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="${LDFLAGS}" -o build/linux_armv7/tailscale ./cmd/tailscale
+-          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="${LDFLAGS}" -o build/linux_armv7/tailscaled ./cmd/tailscaled
+-          tar -czvf "dist/tailscale_${TAG}_linux_armv7.tar.gz" -C build/linux_armv7 tailscale tailscaled
++          # macOS arm64 (Apple Silicon: M1/M2/M3/M4)
++          echo "Building darwin/arm64..."
++          mkdir -p build/darwin_arm64
++          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o build/darwin_arm64/tailscale ./cmd/tailscale
++          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o build/darwin_arm64/tailscaled ./cmd/tailscaled
++          tar -czvf "dist/tailscale_${TAG}_darwin_arm64.tar.gz" -C build/darwin_arm64 tailscale tailscaled
++
++          # macOS amd64 (Intel)
++          echo "Building darwin/amd64..."
++          mkdir -p build/darwin_amd64
++          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o build/darwin_amd64/tailscale ./cmd/tailscale
++          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o build/darwin_amd64/tailscaled ./cmd/tailscaled
++          tar -czvf "dist/tailscale_${TAG}_darwin_amd64.tar.gz" -C build/darwin_amd64 tailscale tailscaled
+ 
+           # Windows amd64 (x86_64)
+           echo "Building windows/amd64..."
+@@ -115,12 +122,12 @@ jobs:
+           if gh release view "${TAG}" >/dev/null 2>&1; then
+             echo "Release ${TAG} already exists. Uploading assets with --clobber..."
+             gh release upload "${TAG}" dist/* --clobber
+-            gh release edit "${TAG}" --notes "Tailscale custom release ${TAG} (with force-derp feature)." || true
++            gh release edit "${TAG}" --notes "Tailscale custom release ${TAG} (with force-derp and auto no-logs-no-support features)." || true
+           else
+             echo "Creating new release ${TAG}..."
+             gh release create "${TAG}" dist/* \
+               --title "${TAG}" \
+-              --notes "Tailscale custom release ${TAG} (with force-derp feature)." \
++              --notes "Tailscale custom release ${TAG} (with force-derp and auto no-logs-no-support features)." \
+               --draft=false \
+               --prerelease=false || {
+                 echo "Creation failed, falling back to upload with --clobber..."
+diff --git a/README.md b/README.md
+index 1daa7a8fa..584ed15d2 100644
+--- a/README.md
++++ b/README.md
+@@ -48,6 +48,15 @@ tailscale debug force-derp
+ - Overrides the WireGuard routing layer to strictly return the DERP relay address for outbound packets.
+ - Drops inbound direct UDP traffic and suppresses outgoing/incoming disco hole punching probes.
+ 
++### Automatic `-no-logs-no-support` by Default
++
++In standard Tailscale builds, `tailscaled` uploads operational and diagnostic logs to Tailscale servers unless explicitly started with `--no-logs-no-support`.
++
++In this custom fork:
++- The `-no-logs-no-support` flag is **automatically enabled by default**.
++- Running `tailscaled` without additional flags immediately disables log uploads and telemetry to external servers without requiring manual configuration.
++- If log uploading is ever desired, it can still be explicitly opted back into via `--no-logs-no-support=false`.
++
+ ### Automated Release Workflow
+ 
+ This fork provides an automated GitHub Action workflow (`Release Custom Tailscale`) to build custom binaries on top of official releases:
+@@ -59,7 +68,7 @@ This fork provides an automated GitHub Action workflow (`Release Custom Tailscal
+ 3. **Automated Pipeline**:
+    - The workflow checks out the clean upstream release tag.
+    - Automatically cherry-picks custom feature commits from `feature/custom` onto the target tag.
+-   - Cross-compiles `tailscale` and `tailscaled` for Linux (`amd64`, `arm64`, `armv7`) and Windows (`amd64`).
++   - Cross-compiles `tailscale` and `tailscaled` for Linux (`amd64`, `arm64`), macOS (`arm64`, `amd64`), and Windows (`amd64`).
+    - Generates SHA256 checksums (`sha256sums.txt`).
+    - Uploads compiled archives directly to GitHub Releases (safely updating existing release assets via `--clobber`).
+ 4. **Download Binaries**: Navigate to the repository's **Releases** page on GitHub to download pre-built packages.
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index 1b0ee602a..0ceded64b 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -231,7 +231,7 @@ func main() {
+ 		flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
+ 	}
+ 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
+-	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
++	flag.BoolVar(&args.disableLogs, "no-logs-no-support", true, "disable log uploads; this also disables any technical support")
+ 	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2); prefix with 'optional:' to boot unconfigured when the source is absent instead of failing")
+ 	if buildfeatures.HasTPM {
+ 		flag.Var(&args.hardwareAttestation, "hardware-attestation", `use hardware-backed keys to bind node identity to this device when supported
+-- 
+2.56.0
+

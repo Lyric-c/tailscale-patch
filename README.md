@@ -4,6 +4,8 @@
 
 This repository is the **patch source and build/release entry point** for a small set of custom Tailscale features. Its GitHub Actions workflow checks out an official Tailscale release tag, applies the patches stored here, runs targeted tests, builds binaries, and publishes the resulting assets to this repository's GitHub Releases.
 
+The most recently validated upstream release tag is `v1.104.7`. The patch set was checked against that exact tag; when targeting other releases, treat application and test compatibility as unverified until the workflow passes.
+
 The patches were developed and tested in the separate Tailscale fork (`3rd-repo/tailscale`, branch `feature/custom`). The fork remains useful as the editable development source and retains the custom code in context with the upstream repository. This repository does not clone or depend on that fork during builds: the workflow uses only the selected upstream tag and the patch files checked into this repository.
 
 In short:
@@ -24,7 +26,7 @@ In short:
 | `SOURCE_COMMIT` | Tailscale fork commit from which the current patch set was exported. |
 | `.github/workflows/release-custom.yml` | Manual build, test, and release workflow executed in this repository. |
 
-Patches are applied in lexicographic filename order. Keep the numeric prefixes and update this README if features, ordering, or responsibilities change. Repository documentation and workflows are not applied to the Tailscale source tree.
+Patches are applied as conventional contextual diffs in lexicographic filename order. If a patch fails against a release tag, stop: do not force it with `--unidiff-zero` or ignore the error. Adapt the feature against that upstream source, regenerate the patch from the fork, and validate the exact patch series against the target tag. Keep the numeric prefixes and update this README if features, ordering, or responsibilities change. Repository documentation and workflows are not applied to the Tailscale source tree.
 
 ## Features currently carried
 

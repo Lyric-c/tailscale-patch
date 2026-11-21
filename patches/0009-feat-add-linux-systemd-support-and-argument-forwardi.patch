@@ -1,5 +1,37 @@
+From dc46db6d18098b655a3f104e709702c2657dfc9b Mon Sep 17 00:00:00 2001
+From: Irelia <cchuanzhao@gmail.com>
+Date: Fri, 30 Oct 2026 10:12:31 +0800
+Subject: [PATCH 09/10] feat: add linux systemd support and argument forwarding
+ to install-system-daemon
+
+---
+ README.md                            |   4 +-
+ cmd/tailscaled/install_darwin.go     |  45 ++++-
+ cmd/tailscaled/install_linux.go      | 239 +++++++++++++++++++++++++++
+ cmd/tailscaled/install_linux_test.go |  71 ++++++++
+ cmd/tailscaled/install_windows.go    |   4 +-
+ cmd/tailscaled/tailscaled.go         |  11 +-
+ 6 files changed, 362 insertions(+), 12 deletions(-)
+ create mode 100644 cmd/tailscaled/install_linux.go
+ create mode 100644 cmd/tailscaled/install_linux_test.go
+
+diff --git a/README.md b/README.md
+index 56ea95eaa..d0e7cd33a 100644
+--- a/README.md
++++ b/README.md
+@@ -63,8 +63,8 @@ In standard Tailscale builds, `tailscaled` does not document its hidden subcomma
+ 
+ In this custom fork:
+ - `tailscaled --help` (and `tailscaled help`) explicitly documents available subcommands:
+-  - `install-system-daemon`: Installs `tailscaled` as a native Windows service or macOS `launchd` daemon.
+-  - `uninstall-system-daemon`: Safely uninstalls and stops the system daemon.
++  - `install-system-daemon [flags]`: Installs and starts `tailscaled` as a native system service on Linux (`systemd`), Windows (Service Control Manager), or macOS (`launchd`), with support for forwarding custom startup flags (e.g. `-statedir=/data/tailscale`, `--port=41641`).
++  - `uninstall-system-daemon`: Safely uninstalls and stops the system service across Linux, Windows, and macOS.
+   - `debug`: Built-in network diagnostics and debugging tools (`--ifconfig`, `--monitor`, `--derp`, `--get-url`).
+ - Running `tailscaled debug` without arguments cleanly prints usage information for its diagnostic flags.
+ 
 diff --git a/cmd/tailscaled/install_darwin.go b/cmd/tailscaled/install_darwin.go
-index 4de1f3122c658241dda0553e971461f01902deeb..e1f01fe488018a6409d6a866d00b2b62ef4c22e0 100644
+index 4de1f3122..e1f01fe48 100644
 --- a/cmd/tailscaled/install_darwin.go
 +++ b/cmd/tailscaled/install_darwin.go
 @@ -13,6 +13,7 @@
@@ -71,7 +103,7 @@ index 4de1f3122c658241dda0553e971461f01902deeb..e1f01fe488018a6409d6a866d00b2b62
  
 diff --git a/cmd/tailscaled/install_linux.go b/cmd/tailscaled/install_linux.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..f31fffe249d6f3ee1ea9939dffcbb0eb55f974bd
+index 000000000..f31fffe24
 --- /dev/null
 +++ b/cmd/tailscaled/install_linux.go
 @@ -0,0 +1,239 @@
@@ -316,7 +348,7 @@ index 0000000000000000000000000000000000000000..f31fffe249d6f3ee1ea9939dffcbb0eb
 +}
 diff --git a/cmd/tailscaled/install_linux_test.go b/cmd/tailscaled/install_linux_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..1c3e1c31f8fa408c8513341a4e1984cc5617aba0
+index 000000000..1c3e1c31f
 --- /dev/null
 +++ b/cmd/tailscaled/install_linux_test.go
 @@ -0,0 +1,71 @@
@@ -392,7 +424,7 @@ index 0000000000000000000000000000000000000000..1c3e1c31f8fa408c8513341a4e1984cc
 +	}
 +}
 diff --git a/cmd/tailscaled/install_windows.go b/cmd/tailscaled/install_windows.go
-index d0f40b37d1156781e0e3b979e1671e2e0212bc56..0b4cc1cada750b9c8e1240ac7e91a055a3de3b7b 100644
+index d0f40b37d..0b4cc1cad 100644
 --- a/cmd/tailscaled/install_windows.go
 +++ b/cmd/tailscaled/install_windows.go
 @@ -44,7 +44,7 @@ func installSystemDaemonWindows(args []string) (err error) {
@@ -413,3 +445,32 @@ index d0f40b37d1156781e0e3b979e1671e2e0212bc56..0b4cc1cada750b9c8e1240ac7e91a055
  	if err != nil {
  		return fmt.Errorf("failed to create %q service: %v", serviceName, err)
  	}
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index 37b07a4d2..8c54a7856 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -366,14 +366,17 @@ func usage() {
+ 	fmt.Fprintf(out, "Subcommands:\n")
+ 	switch runtime.GOOS {
+ 	case "windows":
+-		fmt.Fprintf(out, "  install-system-daemon\n        install tailscaled as a native Windows service\n")
++		fmt.Fprintf(out, "  install-system-daemon [flags]\n        install tailscaled as a native Windows service\n")
+ 		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and remove the native Windows service\n")
+ 	case "darwin":
+-		fmt.Fprintf(out, "  install-system-daemon\n        install and start tailscaled as a macOS launchd daemon\n")
++		fmt.Fprintf(out, "  install-system-daemon [flags]\n        install and start tailscaled as a macOS launchd daemon\n")
+ 		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and stop the macOS launchd daemon\n")
++	case "linux":
++		fmt.Fprintf(out, "  install-system-daemon [flags]\n        install and start tailscaled as a systemd service\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and stop the systemd service\n")
+ 	default:
+-		fmt.Fprintf(out, "  install-system-daemon (Windows and macOS only)\n        install tailscaled as a native system service\n")
+-		fmt.Fprintf(out, "  uninstall-system-daemon (Windows and macOS only)\n        uninstall and remove the native system service\n")
++		fmt.Fprintf(out, "  install-system-daemon [flags] (Linux, Windows and macOS only)\n        install tailscaled as a native system service\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon (Linux, Windows and macOS only)\n        uninstall and remove the native system service\n")
+ 	}
+ 	if buildfeatures.HasDebug {
+ 		fmt.Fprintf(out, "  debug [debug-flags]\n        run network diagnostics and debugging tools\n")
+-- 
+2.56.0
+

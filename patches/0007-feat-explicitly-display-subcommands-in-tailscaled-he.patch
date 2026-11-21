@@ -1,0 +1,140 @@
+From 39755dd729d198a0e0d2e01dd727a2134d634278 Mon Sep 17 00:00:00 2001
+From: Irelia <cchuanzhao@gmail.com>
+Date: Thu, 29 Oct 2026 11:02:08 +0800
+Subject: [PATCH 07/10] feat: explicitly display subcommands in tailscaled help
+ and document usage
+
+---
+ README.md                         | 11 +++++++++++
+ cmd/tailscaled/debug.go           |  4 ++++
+ cmd/tailscaled/tailscaled.go      | 30 ++++++++++++++++++++++++++++++
+ cmd/tailscaled/tailscaled_test.go | 18 ++++++++++++++++++
+ 4 files changed, 63 insertions(+)
+
+diff --git a/README.md b/README.md
+index d039da67e..0af5b1097 100644
+--- a/README.md
++++ b/README.md
+@@ -57,6 +57,17 @@ In this custom fork:
+ - Running `tailscaled` without additional flags immediately disables log uploads and telemetry to external servers without requiring manual configuration.
+ - If log uploading is ever desired, it can still be explicitly opted back into via `--no-logs-no-support=false`.
+ 
++### Explicit Subcommands in `tailscaled` Help
++
++In standard Tailscale builds, `tailscaled` does not document its hidden subcommands in `tailscaled --help`.
++
++In this custom fork:
++- `tailscaled --help` (and `tailscaled help`) explicitly documents available subcommands:
++  - `install-system-daemon`: Installs `tailscaled` as a native Windows service or macOS `launchd` daemon.
++  - `uninstall-system-daemon`: Safely uninstalls and stops the system daemon.
++  - `debug`: Built-in network diagnostics and debugging tools (`--ifconfig`, `--monitor`, `--derp`, `--get-url`).
++- Running `tailscaled debug` without arguments cleanly prints usage information for its diagnostic flags.
++
+ ### Automated Release Workflow
+ 
+ This fork provides an automated GitHub Action workflow (`Release Custom Tailscale`) to build custom binaries on top of official releases:
+diff --git a/cmd/tailscaled/debug.go b/cmd/tailscaled/debug.go
+index 360075f5b..05f35a96d 100644
+--- a/cmd/tailscaled/debug.go
++++ b/cmd/tailscaled/debug.go
+@@ -73,6 +73,10 @@ func debugMode(args []string) error {
+ 	fs.BoolVar(&debugArgs.portmap, "portmap", false, "If true, run portmap debugging. Precludes all other options.")
+ 	fs.StringVar(&debugArgs.getURL, "get-url", "", "If non-empty, fetch provided URL.")
+ 	fs.StringVar(&debugArgs.derpCheck, "derp", "", "if non-empty, test a DERP ping via named region code")
++	if len(args) == 0 {
++		fs.Usage()
++		return nil
++	}
+ 	if err := fs.Parse(args); err != nil {
+ 		return err
+ 	}
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index 0ceded64b..37b07a4d2 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -246,12 +246,18 @@ func main() {
+ 		f()
+ 	}
+ 
++	flag.Usage = usage
++
+ 	if runtime.GOOS == "plan9" && os.Getenv("_NETSHELL_CHILD_") != "" {
+ 		os.Args = []string{"tailscaled", "be-child", "plan9-netshell"}
+ 	}
+ 
+ 	if len(os.Args) > 1 {
+ 		sub := os.Args[1]
++		if sub == "help" {
++			flag.Usage()
++			return
++		}
+ 		if fp, ok := subCommands[sub]; ok {
+ 			if fp == nil {
+ 				log.SetFlags(0)
+@@ -353,6 +359,30 @@ func main() {
+ 	}
+ }
+ 
++func usage() {
++	out := flag.CommandLine.Output()
++	fmt.Fprintf(out, "Usage: %s [flags]\n", os.Args[0])
++	fmt.Fprintf(out, "       %s <subcommand> [flags]\n\n", os.Args[0])
++	fmt.Fprintf(out, "Subcommands:\n")
++	switch runtime.GOOS {
++	case "windows":
++		fmt.Fprintf(out, "  install-system-daemon\n        install tailscaled as a native Windows service\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and remove the native Windows service\n")
++	case "darwin":
++		fmt.Fprintf(out, "  install-system-daemon\n        install and start tailscaled as a macOS launchd daemon\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon\n        uninstall and stop the macOS launchd daemon\n")
++	default:
++		fmt.Fprintf(out, "  install-system-daemon (Windows and macOS only)\n        install tailscaled as a native system service\n")
++		fmt.Fprintf(out, "  uninstall-system-daemon (Windows and macOS only)\n        uninstall and remove the native system service\n")
++	}
++	if buildfeatures.HasDebug {
++		fmt.Fprintf(out, "  debug [debug-flags]\n        run network diagnostics and debugging tools\n")
++		fmt.Fprintf(out, "        flags: --ifconfig, --monitor, --derp=<region>, --get-url=<url>\n")
++	}
++	fmt.Fprintf(out, "\nFlags:\n")
++	flag.PrintDefaults()
++}
++
+ // applyWindowsMode validates --windows-mode and --socket on Windows and, in
+ // dev mode, applies the per-user default socket.
+ //
+diff --git a/cmd/tailscaled/tailscaled_test.go b/cmd/tailscaled/tailscaled_test.go
+index ab6482293..72653f08a 100644
+--- a/cmd/tailscaled/tailscaled_test.go
++++ b/cmd/tailscaled/tailscaled_test.go
+@@ -4,6 +4,8 @@
+ package main // import "tailscale.com/cmd/tailscaled"
+ 
+ import (
++	"bytes"
++	"flag"
+ 	"os"
+ 	"strings"
+ 	"testing"
+@@ -141,3 +143,19 @@ func TestIsPortableStore(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestUsage(t *testing.T) {
++	var buf bytes.Buffer
++	flag.CommandLine.SetOutput(&buf)
++	defer flag.CommandLine.SetOutput(os.Stderr)
++
++	usage()
++
++	out := buf.String()
++	for _, sub := range []string{"install-system-daemon", "uninstall-system-daemon", "debug"} {
++		if !strings.Contains(out, sub) {
++			t.Errorf("usage output missing subcommand %q; got:\n%s", sub, out)
++		}
++	}
++}
++
+-- 
+2.56.0
+

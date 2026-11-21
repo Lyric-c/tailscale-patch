@@ -1,5 +1,169 @@
+From cba486068f884f3957bebf47928087dfb4bc7931 Mon Sep 17 00:00:00 2001
+From: Irelia <cchuanzhao@gmail.com>
+Date: Thu, 15 Oct 2026 17:53:02 +0800
+Subject: [PATCH 01/10] feat: add tailscale debug force-derp command and
+ release workflow
+
+---
+ .github/workflows/release-custom.yml      |  92 +++++++++++++++++++
+ README.md                                 |  25 +++++
+ cmd/tailscale/cli/debug.go                |   1 +
+ cmd/tailscale/cli/debug_forcederp.go      |  50 ++++++++++
+ cmd/tailscale/cli/debug_forcederp_test.go |  37 ++++++++
+ ipn/ipnlocal/forcederp.go                 |  19 ++++
+ ipn/localapi/debug.go                     |   4 +
+ ipn/localapi/debug_forcederp.go           |  26 ++++++
+ ipn/localapi/debug_forcederp_test.go      |  60 ++++++++++++
+ wgengine/magicsock/endpoint.go            |  27 ++++--
+ wgengine/magicsock/forcederp.go           |  27 ++++++
+ wgengine/magicsock/forcederp_test.go      | 107 ++++++++++++++++++++++
+ wgengine/magicsock/magicsock.go           |  17 +++-
+ 13 files changed, 481 insertions(+), 11 deletions(-)
+ create mode 100644 .github/workflows/release-custom.yml
+ create mode 100644 cmd/tailscale/cli/debug_forcederp.go
+ create mode 100644 cmd/tailscale/cli/debug_forcederp_test.go
+ create mode 100644 ipn/ipnlocal/forcederp.go
+ create mode 100644 ipn/localapi/debug_forcederp.go
+ create mode 100644 ipn/localapi/debug_forcederp_test.go
+ create mode 100644 wgengine/magicsock/forcederp.go
+ create mode 100644 wgengine/magicsock/forcederp_test.go
+
+diff --git a/.github/workflows/release-custom.yml b/.github/workflows/release-custom.yml
+new file mode 100644
+index 000000000..7c294b4af
+--- /dev/null
++++ b/.github/workflows/release-custom.yml
+@@ -0,0 +1,92 @@
++name: Release Custom Tailscale
++
++on:
++  workflow_dispatch:
++    inputs:
++      tag:
++        description: 'Release Tag (e.g. v1.78.0-custom)'
++        required: true
++        type: string
++      merge_upstream:
++        description: 'Merge latest upstream main before building'
++        required: false
++        default: true
++        type: boolean
++
++permissions:
++  contents: write
++
++jobs:
++  build-and-release:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Check out code
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - name: Merge latest upstream
++        if: ${{ inputs.merge_upstream }}
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "github-actions[bot]@users.noreply.github.com"
++          git remote add upstream https://github.com/tailscale/tailscale.git || true
++          git fetch upstream main
++          git merge upstream/main --no-edit
++
++      - name: Set up Go
++        uses: actions/setup-go@v5
++        with:
++          go-version-file: 'go.mod'
++          cache: true
++
++      - name: Build binaries
++        run: |
++          set -e
++          TAG="${{ inputs.tag }}"
++          mkdir -p dist
++
++          LDFLAGS="-s -w -X tailscale.com/version.longStamp=${TAG} -X tailscale.com/version.shortStamp=${TAG}"
++
++          # Linux amd64 (x86_64)
++          echo "Building linux/amd64..."
++          mkdir -p build/linux_amd64
++          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o build/linux_amd64/tailscale ./cmd/tailscale
++          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o build/linux_amd64/tailscaled ./cmd/tailscaled
++          tar -czvf "dist/tailscale_${TAG}_linux_amd64.tar.gz" -C build/linux_amd64 tailscale tailscaled
++
++          # Linux arm64
++          echo "Building linux/arm64..."
++          mkdir -p build/linux_arm64
++          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o build/linux_arm64/tailscale ./cmd/tailscale
++          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o build/linux_arm64/tailscaled ./cmd/tailscaled
++          tar -czvf "dist/tailscale_${TAG}_linux_arm64.tar.gz" -C build/linux_arm64 tailscale tailscaled
++
++          # Linux armv7
++          echo "Building linux/armv7..."
++          mkdir -p build/linux_armv7
++          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="${LDFLAGS}" -o build/linux_armv7/tailscale ./cmd/tailscale
++          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="${LDFLAGS}" -o build/linux_armv7/tailscaled ./cmd/tailscaled
++          tar -czvf "dist/tailscale_${TAG}_linux_armv7.tar.gz" -C build/linux_armv7 tailscale tailscaled
++
++          # Windows amd64 (x86_64)
++          echo "Building windows/amd64..."
++          mkdir -p build/windows_amd64
++          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o build/windows_amd64/tailscale.exe ./cmd/tailscale
++          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o build/windows_amd64/tailscaled.exe ./cmd/tailscaled
++          (cd build/windows_amd64 && zip -r "../../dist/tailscale_${TAG}_windows_amd64.zip" tailscale.exe tailscaled.exe)
++
++          # Generate sha256 checksums
++          echo "Generating checksums..."
++          (cd dist && sha256sum * > sha256sums.txt)
++
++      - name: Create Release and Upload Assets
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          TAG="${{ inputs.tag }}"
++          gh release create "${TAG}" dist/* \
++            --title "${TAG}" \
++            --notes "Tailscale custom release ${TAG} (with force-derp feature)." \
++            --draft=false \
++            --prerelease=false
+diff --git a/README.md b/README.md
+index c3fa62bba..697f3e9c8 100644
+--- a/README.md
++++ b/README.md
+@@ -23,6 +23,31 @@ Other [Tailscale repos](https://github.com/orgs/tailscale/repositories) of note:
+ For background on which parts of Tailscale are open source and why,
+ see [https://tailscale.com/opensource/](https://tailscale.com/opensource/).
+ 
++## Custom Features (自定义特性)
++
++本仓库基于官方 Tailscale 进行定制开发，增加了以下功能特性：
++
++### 强制 DERP 中转 (`force-derp`)
++
++支持通过 debug 命令动态配置当前节点是否强制仅使用 DERP 进行中转（禁用 P2P 直连打洞与 UDP 数据传输）：
++
++```bash
++# 强制开启 DERP 中转（禁止所有 UDP 直连，所有节点间流量均走 DERP 中转）
++tailscale debug force-derp true
++
++# 恢复默认模式（允许自动 NAT 打洞与直连）
++tailscale debug force-derp false
++
++# 查询当前节点是否处于强制 DERP 模式
++tailscale debug force-derp
++```
++
++**实现机制**：
++- 开启时立即清除已建立的直连路径缓存 (`bestAddr`)；
++- 停止向协调服务器（Control Plane）上报本机 UDP 直连端点，对端节点不会尝试直连；
++- 在路由层拦截直连发包，确保 WireGuard 报文只返回 DERP 地址；
++- 阻断入站/出站的 UDP 直连报文与 disco 打洞探测。
++
+ ## Using
+ 
+ We serve packages for a variety of distros and platforms at
 diff --git a/cmd/tailscale/cli/debug.go b/cmd/tailscale/cli/debug.go
-index 5dc503b268fe11da6ae1d67cc569728247013f6c..aa780602a305ff2760b559e2e8cecc9b0583aa4c 100644
+index 5dc503b26..aa780602a 100644
 --- a/cmd/tailscale/cli/debug.go
 +++ b/cmd/tailscale/cli/debug.go
 @@ -234,6 +234,7 @@ func debugCmd() *ffcli.Command {
@@ -12,7 +176,7 @@ index 5dc503b268fe11da6ae1d67cc569728247013f6c..aa780602a305ff2760b559e2e8cecc9b
  				ShortUsage: "tailscale debug force-netmap-update",
 diff --git a/cmd/tailscale/cli/debug_forcederp.go b/cmd/tailscale/cli/debug_forcederp.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..2d5c760f9ecad832ecc20c022963a35e73daa796
+index 000000000..2d5c760f9
 --- /dev/null
 +++ b/cmd/tailscale/cli/debug_forcederp.go
 @@ -0,0 +1,50 @@
@@ -68,7 +232,7 @@ index 0000000000000000000000000000000000000000..2d5c760f9ecad832ecc20c022963a35e
 +}
 diff --git a/cmd/tailscale/cli/debug_forcederp_test.go b/cmd/tailscale/cli/debug_forcederp_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..4d977a7dbc47f36247b6b0add7b752f83c13e82c
+index 000000000..4d977a7db
 --- /dev/null
 +++ b/cmd/tailscale/cli/debug_forcederp_test.go
 @@ -0,0 +1,37 @@
@@ -111,7 +275,7 @@ index 0000000000000000000000000000000000000000..4d977a7dbc47f36247b6b0add7b752f8
 +}
 diff --git a/ipn/ipnlocal/forcederp.go b/ipn/ipnlocal/forcederp.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..db0d98b91156ecb9690d7d217e8769a6361447c9
+index 000000000..db0d98b91
 --- /dev/null
 +++ b/ipn/ipnlocal/forcederp.go
 @@ -0,0 +1,19 @@
@@ -135,7 +299,7 @@ index 0000000000000000000000000000000000000000..db0d98b91156ecb9690d7d217e8769a6
 +	return false
 +}
 diff --git a/ipn/localapi/debug.go b/ipn/localapi/debug.go
-index a6e8f81d08b8fd1addd8dda666539e3352525dc2..160bb0d579356a33677b66827003579688bac678 100644
+index b2aa87fff..86d865c7b 100644
 --- a/ipn/localapi/debug.go
 +++ b/ipn/localapi/debug.go
 @@ -223,6 +223,10 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +315,7 @@ index a6e8f81d08b8fd1addd8dda666539e3352525dc2..160bb0d579356a33677b668270035796
  		slices.SortFunc(servers, func(a, b netip.Addr) int {
 diff --git a/ipn/localapi/debug_forcederp.go b/ipn/localapi/debug_forcederp.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..bf0094fc260d541b5759aead93ed5b583864a9f8
+index 000000000..bf0094fc2
 --- /dev/null
 +++ b/ipn/localapi/debug_forcederp.go
 @@ -0,0 +1,26 @@
@@ -183,7 +347,7 @@ index 0000000000000000000000000000000000000000..bf0094fc260d541b5759aead93ed5b58
 +}
 diff --git a/ipn/localapi/debug_forcederp_test.go b/ipn/localapi/debug_forcederp_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..07fe5f4f8285f7f81343e72be12a388bfaf92c7d
+index 000000000..07fe5f4f8
 --- /dev/null
 +++ b/ipn/localapi/debug_forcederp_test.go
 @@ -0,0 +1,60 @@
@@ -248,7 +412,7 @@ index 0000000000000000000000000000000000000000..07fe5f4f8285f7f81343e72be12a388b
 +	}
 +}
 diff --git a/wgengine/magicsock/endpoint.go b/wgengine/magicsock/endpoint.go
-index 23fdc9782b29023590bee59492a932429f6b7e92..4cf26fe496a4659214dd25dcce0e39a1f2e39dcb 100644
+index 823a702d1..6fe74b1bb 100644
 --- a/wgengine/magicsock/endpoint.go
 +++ b/wgengine/magicsock/endpoint.go
 @@ -111,6 +111,9 @@ type endpoint struct {
@@ -264,13 +428,13 @@ index 23fdc9782b29023590bee59492a932429f6b7e92..4cf26fe496a4659214dd25dcce0e39a1
 @@ -633,6 +636,9 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
  //
  // TODO(val): Rewrite the addrFor*Locked() variations to share code.
- func (de *endpoint) addrForSendLocked(now mono.Time, forceMirror bool) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
+ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
 +	if de.c.ForceDERP() {
 +		return epAddr{}, de.derpAddr, false
 +	}
  	udpAddr = de.bestAddr.epAddr
  
- 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) && !forceMirror {
+ 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
 @@ -717,6 +723,9 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, s
  //
  // de.mu must be held.
@@ -279,7 +443,7 @@ index 23fdc9782b29023590bee59492a932429f6b7e92..4cf26fe496a4659214dd25dcce0e39a1
 +		return epAddr{}, de.derpAddr
 +	}
  	if size == 0 {
- 		udpAddr, derpAddr, _ = de.addrForSendLocked(now, false)
+ 		udpAddr, derpAddr, _ = de.addrForSendLocked(now)
  		return
 @@ -963,7 +972,7 @@ func (de *endpoint) discoverUDPRelayPathsLocked(now mono.Time) {
  // wantUDPRelayPathDiscoveryLocked reports whether we should kick off UDP relay
@@ -328,7 +492,7 @@ index 23fdc9782b29023590bee59492a932429f6b7e92..4cf26fe496a4659214dd25dcce0e39a1
  		return // skip when direct UDP is disabled
  	}
  	de.lastFullPing = now
-@@ -2017,7 +2030,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
+@@ -1995,7 +2008,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
  
  	// Promote this pong response to our current best address if it's lower latency.
  	// TODO(bradfitz): decide how latency vs. preference order affects decision
@@ -337,7 +501,7 @@ index 23fdc9782b29023590bee59492a932429f6b7e92..4cf26fe496a4659214dd25dcce0e39a1
  		thisPong := addrQuality{
  			epAddr:  sp.to,
  			latency: latency,
-@@ -2176,8 +2189,8 @@ func betterAddr(a, b addrQuality) bool {
+@@ -2154,8 +2167,8 @@ func betterAddr(a, b addrQuality) bool {
  // already sent to us via UDP, so their stateful firewall should be
  // open. Now we can Ping back and make it through.
  func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
@@ -350,7 +514,7 @@ index 23fdc9782b29023590bee59492a932429f6b7e92..4cf26fe496a4659214dd25dcce0e39a1
  	de.mu.Lock()
 diff --git a/wgengine/magicsock/forcederp.go b/wgengine/magicsock/forcederp.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..e407565f4a849d2386d6636b63e946492a31f97c
+index 000000000..d06eb39fa
 --- /dev/null
 +++ b/wgengine/magicsock/forcederp.go
 @@ -0,0 +1,27 @@
@@ -361,7 +525,7 @@ index 0000000000000000000000000000000000000000..e407565f4a849d2386d6636b63e94649
 +
 +// ForceDERP reports whether magicsock is forced to only use DERP relay.
 +func (c *Conn) ForceDERP() bool {
-+	return c != nil && c.forceDERP.Load()
++	return c.forceDERP.Load()
 +}
 +
 +// SetForceDERP controls whether magicsock is forced to only use DERP relay.
@@ -383,10 +547,10 @@ index 0000000000000000000000000000000000000000..e407565f4a849d2386d6636b63e94649
 +}
 diff --git a/wgengine/magicsock/forcederp_test.go b/wgengine/magicsock/forcederp_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..86d1a52045e5735b0f3acd5a68a4ab64a5e5d88e
+index 000000000..a9be7751d
 --- /dev/null
 +++ b/wgengine/magicsock/forcederp_test.go
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,107 @@
 +// Copyright (c) Tailscale Inc & contributors
 +// SPDX-License-Identifier: BSD-3-Clause
 +
@@ -405,11 +569,6 @@ index 0000000000000000000000000000000000000000..86d1a52045e5735b0f3acd5a68a4ab64
 +
 +func TestForceDERP(t *testing.T) {
 +	c := newConn(t.Logf)
-+	// newConn has no packet connections; keep ReSTUN from starting an async
-+	// endpoint update that would expect initialized sockets.
-+	c.mu.Lock()
-+	c.closed = true
-+	c.mu.Unlock()
 +
 +	if c.ForceDERP() {
 +		t.Fatal("expected ForceDERP initially false")
@@ -447,7 +606,7 @@ index 0000000000000000000000000000000000000000..86d1a52045e5735b0f3acd5a68a4ab64
 +	// Verify addrForSendLocked returns DERP only
 +	now := mono.Now()
 +	ep.mu.Lock()
-+	udpAddr, derpAddr, shouldPing := ep.addrForSendLocked(now, false)
++	udpAddr, derpAddr, shouldPing := ep.addrForSendLocked(now)
 +	ep.mu.Unlock()
 +
 +	if udpAddr.ap.IsValid() {
@@ -488,7 +647,7 @@ index 0000000000000000000000000000000000000000..86d1a52045e5735b0f3acd5a68a4ab64
 +		t.Fatalf("sendUDP returned sent=%v, err=%v; want sent=false, errNoUDP", sent, err)
 +	}
 +
-+	sent, err = c.sendUDPBatch(0, epAddr{ap: netip.MustParseAddrPort("192.168.1.100:1234")}, [][]byte{[]byte("test")}, 0)
++	sent, err = c.sendUDPBatch(epAddr{ap: netip.MustParseAddrPort("192.168.1.100:1234")}, [][]byte{[]byte("test")}, 0)
 +	if sent || err != errNoUDP {
 +		t.Fatalf("sendUDPBatch returned sent=%v, err=%v; want sent=false, errNoUDP", sent, err)
 +	}
@@ -500,10 +659,10 @@ index 0000000000000000000000000000000000000000..86d1a52045e5735b0f3acd5a68a4ab64
 +	}
 +}
 diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
-index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a6d8b27e2 100644
+index 84de9fc7e..44b8a0ba6 100644
 --- a/wgengine/magicsock/magicsock.go
 +++ b/wgengine/magicsock/magicsock.go
-@@ -287,6 +287,7 @@ type Conn struct {
+@@ -283,6 +283,7 @@ type Conn struct {
  	muCond *sync.Cond
  
  	onlyTCP443 atomic.Bool
@@ -511,7 +670,7 @@ index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a
  
  	closed  bool        // Close was called
  	closing atomic.Bool // Close is in progress (or done)
-@@ -610,6 +611,7 @@ func newConn(logf logger.Logf) *Conn {
+@@ -592,6 +593,7 @@ func newConn(logf logger.Logf) *Conn {
  	c.bind = &connBind{Conn: c, closed: true}
  	c.muCond = sync.NewCond(&c.mu)
  	c.networkUp.Store(true) // assume up until told otherwise
@@ -519,7 +678,7 @@ index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a
  	return c
  }
  
-@@ -1320,7 +1322,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
+@@ -1299,7 +1301,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
  			},
  		}, nil
  	}
@@ -528,19 +687,16 @@ index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a
  		// Peers can only reach us over DERP, so we have no endpoints to
  		// advertise.
  		return nil, nil
-@@ -1596,8 +1598,10 @@ func batchContainsHandshakeRetry(buffs [][]byte, offset int) bool {
- // peer traffic is relayed over DERP.
- const hasUDPTransport = buildfeatures.HasUDPTransport && runtime.GOOS != "js"
+@@ -1541,7 +1543,7 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
+ var errUnsupportedConnType = errors.New("unsupported connection type")
  
-+var errUnsupportedConnType = errors.New("unsupported connection type")
-+
- func (c *Conn) sendUDPBatch(flow int, addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
+ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
 -	if !hasUDPTransport {
 +	if !hasUDPTransport || c.ForceDERP() {
  		return false, errNoUDP
  	}
  	isIPv6 := false
-@@ -1627,7 +1631,7 @@ func (c *Conn) sendUDPBatch(flow int, addr epAddr, buffs [][]byte, offset int) (
+@@ -1571,7 +1573,7 @@ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool,
  // sendUDP sends UDP packet b to ipp.
  // See sendAddr's docs on the return value meanings.
  func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
@@ -549,7 +705,7 @@ index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a
  		return false, errNoUDP
  	}
  	sent, err = c.sendUDPStd(ipp, b)
-@@ -1952,6 +1956,9 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
+@@ -1843,6 +1845,9 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
  	}
  	switch pt {
  	case packetLooksLikeDisco:
@@ -559,7 +715,7 @@ index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a
  		if isGeneveEncap {
  			b = b[packet.GeneveFixedHeaderLength:]
  		}
-@@ -1972,6 +1979,10 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
+@@ -1863,6 +1868,10 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
  		// be potentially WireGuard.
  	}
  
@@ -570,7 +726,7 @@ index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a
  	if !c.havePrivateKey.Load() {
  		// If we have no private key, we're logged out or
  		// stopped. Don't try to pass these wireguard packets
-@@ -2689,7 +2700,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
+@@ -2582,7 +2591,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
  
  	// This is a naked [disco.Ping] without a VNI.
  
@@ -579,3 +735,6 @@ index edda0be72be2687e2f2130a2f46d70f23bc4c492..42f3edb9add8f3f7fb0532ad0945633a
  		return
  	}
  
+-- 
+2.56.0
+

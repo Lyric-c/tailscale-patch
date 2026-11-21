@@ -1,0 +1,143 @@
+From 9a2b311d727cd3c1c5b72155058441b42cc97a02 Mon Sep 17 00:00:00 2001
+From: Irelia <cchuanzhao@gmail.com>
+Date: Mon, 19 Oct 2026 09:10:31 +0800
+Subject: [PATCH 03/10] ci: implement clean tag release workflow and document
+ in README
+
+---
+ .github/workflows/release-custom.yml | 71 +++++++++++++++++++++-------
+ README.md                            | 16 +++++++
+ 2 files changed, 70 insertions(+), 17 deletions(-)
+
+diff --git a/.github/workflows/release-custom.yml b/.github/workflows/release-custom.yml
+index 7c294b4af..b49968580 100644
+--- a/.github/workflows/release-custom.yml
++++ b/.github/workflows/release-custom.yml
+@@ -4,14 +4,9 @@ on:
+   workflow_dispatch:
+     inputs:
+       tag:
+-        description: 'Release Tag (e.g. v1.78.0-custom)'
++        description: 'Target Upstream Release Tag (e.g. v1.104.1)'
+         required: true
+         type: string
+-      merge_upstream:
+-        description: 'Merge latest upstream main before building'
+-        required: false
+-        default: true
+-        type: boolean
+ 
+ permissions:
+   contents: write
+@@ -25,14 +20,45 @@ jobs:
+         with:
+           fetch-depth: 0
+ 
+-      - name: Merge latest upstream
+-        if: ${{ inputs.merge_upstream }}
++      - name: Apply custom features to target tag
+         run: |
++          set -e
++          TAG="${{ inputs.tag }}"
++          BASE_TAG="${TAG%-custom}"
++
+           git config user.name "github-actions[bot]"
+           git config user.email "github-actions[bot]@users.noreply.github.com"
+-          git remote add upstream https://github.com/tailscale/tailscale.git || true
+-          git fetch upstream main
+-          git merge upstream/main --no-edit
++
++          echo "Fetching all tags and remote branches..."
++          git fetch --tags origin
++          git fetch origin feature/custom:refs/remotes/origin/feature/custom || true
++
++          # If the base tag is not in origin, fetch tags from upstream
++          if ! git rev-parse -q --verify "refs/tags/${BASE_TAG}" >/dev/null; then
++            echo "Tag ${BASE_TAG} not found in origin. Fetching from upstream..."
++            git remote add upstream https://github.com/tailscale/tailscale.git || true
++            git fetch --tags upstream
++          fi
++
++          if ! git rev-parse -q --verify "refs/tags/${BASE_TAG}" >/dev/null; then
++            echo "Error: Tag ${BASE_TAG} does not exist in origin or upstream!"
++            exit 1
++          fi
++
++          echo "Checking out clean tag ${BASE_TAG}..."
++          git checkout -B "build-${TAG}" "refs/tags/${BASE_TAG}"
++
++          echo "Determining custom commits on origin/feature/custom..."
++          BASE=$(git merge-base origin/main origin/feature/custom)
++          COMMITS=$(git rev-list --reverse "${BASE}..origin/feature/custom")
++
++          if [ -n "${COMMITS}" ]; then
++            echo "Cherry-picking custom commits onto ${BASE_TAG}:"
++            echo "${COMMITS}"
++            git cherry-pick ${COMMITS}
++          else
++            echo "No custom commits detected to cherry-pick."
++          fi
+ 
+       - name: Set up Go
+         uses: actions/setup-go@v5
+@@ -80,13 +106,24 @@ jobs:
+           echo "Generating checksums..."
+           (cd dist && sha256sum * > sha256sums.txt)
+ 
+-      - name: Create Release and Upload Assets
++      - name: Publish Release Assets
+         env:
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         run: |
+           TAG="${{ inputs.tag }}"
+-          gh release create "${TAG}" dist/* \
+-            --title "${TAG}" \
+-            --notes "Tailscale custom release ${TAG} (with force-derp feature)." \
+-            --draft=false \
+-            --prerelease=false
++
++          if gh release view "${TAG}" >/dev/null 2>&1; then
++            echo "Release ${TAG} already exists. Uploading assets with --clobber..."
++            gh release upload "${TAG}" dist/* --clobber
++            gh release edit "${TAG}" --notes "Tailscale custom release ${TAG} (with force-derp feature)." || true
++          else
++            echo "Creating new release ${TAG}..."
++            gh release create "${TAG}" dist/* \
++              --title "${TAG}" \
++              --notes "Tailscale custom release ${TAG} (with force-derp feature)." \
++              --draft=false \
++              --prerelease=false || {
++                echo "Creation failed, falling back to upload with --clobber..."
++                gh release upload "${TAG}" dist/* --clobber
++              }
++          fi
+diff --git a/README.md b/README.md
+index 1753e283c..1daa7a8fa 100644
+--- a/README.md
++++ b/README.md
+@@ -48,6 +48,22 @@ tailscale debug force-derp
+ - Overrides the WireGuard routing layer to strictly return the DERP relay address for outbound packets.
+ - Drops inbound direct UDP traffic and suppresses outgoing/incoming disco hole punching probes.
+ 
++### Automated Release Workflow
++
++This fork provides an automated GitHub Action workflow (`Release Custom Tailscale`) to build custom binaries on top of official releases:
++
++1. **Sync with Upstream**: Click **Sync fork** on GitHub to pull the latest upstream releases and tags into your fork.
++2. **Trigger the Workflow**:
++   - Go to **Actions** -> **Release Custom Tailscale** -> **Run workflow**.
++   - Input the desired upstream release tag (e.g., `v1.104.1`).
++3. **Automated Pipeline**:
++   - The workflow checks out the clean upstream release tag.
++   - Automatically cherry-picks custom feature commits from `feature/custom` onto the target tag.
++   - Cross-compiles `tailscale` and `tailscaled` for Linux (`amd64`, `arm64`, `armv7`) and Windows (`amd64`).
++   - Generates SHA256 checksums (`sha256sums.txt`).
++   - Uploads compiled archives directly to GitHub Releases (safely updating existing release assets via `--clobber`).
++4. **Download Binaries**: Navigate to the repository's **Releases** page on GitHub to download pre-built packages.
++
+ ## Using
+ 
+ We serve packages for a variety of distros and platforms at
+-- 
+2.56.0
+
